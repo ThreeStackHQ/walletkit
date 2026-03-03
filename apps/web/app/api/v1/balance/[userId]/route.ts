@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
+import { eq, and } from "drizzle-orm";
+import { getDb, creditWallets } from "@walletkit/db";
+import { resolveWorkspace, extractApiKey } from "@/lib/apikey";
+import { env } from "@/lib/env";
 
 interface RouteContext {
   params: { userId: string };
 }
 
-export async function GET(
-  req: NextRequest,
-  context: RouteContext,
-): Promise<NextResponse> {
-  const apiKey = req.headers.get("authorization")?.replace("Bearer ", "");
-  if (!apiKey) {
+export async function GET(req: NextRequest, context: RouteContext): Promise<NextResponse> {
+  const apiKey = extractApiKey(req);
+  const workspace = await resolveWorkspace(apiKey);
+  if (!workspace) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -18,16 +20,22 @@ export async function GET(
     return NextResponse.json({ error: "userId is required" }, { status: 400 });
   }
 
-  // TODO: resolve workspace from apiKey, fetch wallet by externalUserId
-  void userId;
+  const db = getDb(env.DATABASE_URL);
+  const wallet = await db.query.creditWallets.findFirst({
+    where: and(
+      eq(creditWallets.workspaceId, workspace.id),
+      eq(creditWallets.externalUserId, userId),
+    ),
+  });
 
-  return NextResponse.json(
-    {
-      balance: 0,
-      totalGranted: 0,
-      totalSpent: 0,
-      lastReset: null,
-    },
-    { status: 200 },
-  );
+  if (!wallet) {
+    return NextResponse.json({ error: "Wallet not found" }, { status: 404 });
+  }
+
+  return NextResponse.json({
+    balance: wallet.balance,
+    totalGranted: wallet.totalGranted,
+    totalSpent: wallet.totalSpent,
+    lastReset: wallet.lastResetAt?.toISOString() ?? null,
+  });
 }
