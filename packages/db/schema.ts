@@ -27,9 +27,6 @@ export const workspaces = pgTable("workspaces", {
   stripeSubscriptionId: text("stripe_subscription_id"),
   apiKeyHash: text("api_key_hash"),
   apiKeyHint: text("api_key_hint"),
-  /** Only set once on creation, cleared after first reveal */
-  apiKeyPlain: text("api_key_plain"),
-  apiKeyRevealedAt: timestamp("api_key_revealed_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });

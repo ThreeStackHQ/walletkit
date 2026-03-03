@@ -1,5 +1,8 @@
 import type { NextAuthOptions } from "next-auth";
 import EmailProvider from "next-auth/providers/email";
+import { eq } from "drizzle-orm";
+import { getDb, users } from "@walletkit/db";
+import { env } from "./env";
 
 export const authOptions: NextAuthOptions = {
   providers: [
@@ -18,7 +21,19 @@ export const authOptions: NextAuthOptions = {
   callbacks: {
     async session({ session, user }) {
       if (session.user) {
-        (session.user as typeof session.user & { id: string }).id = user.id;
+        const extended = session.user as typeof session.user & {
+          id: string;
+          workspaceId: string | null;
+        };
+        extended.id = user.id;
+
+        const db = getDb(env.DATABASE_URL);
+        const rows = await db
+          .select({ workspaceId: users.workspaceId })
+          .from(users)
+          .where(eq(users.id, user.id))
+          .limit(1);
+        extended.workspaceId = rows[0]?.workspaceId ?? null;
       }
       return session;
     },
