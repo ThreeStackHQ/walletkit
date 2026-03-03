@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { and, eq, sql } from "drizzle-orm";
+import { getDb, creditWallets, creditLedgerEntries } from "@walletkit/db";
 import { rateLimit } from "@/lib/rate-limit";
 import { withCors, optionsResponse } from "@/lib/cors";
 import { resolveWorkspaceFromApiKey } from "@/lib/resolve-api-key";
+import { env } from "@/lib/env";
 
 const grantSchema = z.object({
   userId: z.string().min(1),
@@ -54,19 +57,77 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // TODO: upsert wallet, add balance, write ledger entry — wallet must belong to workspace.id (IDOR guard)
-  const { userId, amount } = parsed.data;
-  void userId;
-  void amount;
-  void workspace;
+  const { userId, amount, idempotencyKey, reason } = parsed.data;
+  const db = getDb(env.DATABASE_URL);
+
+  // Idempotency check
+  if (idempotencyKey) {
+    const existing = await db
+      .select()
+      .from(creditLedgerEntries)
+      .where(
+        and(
+          eq(creditLedgerEntries.workspaceId, workspace.id),
+          eq(creditLedgerEntries.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .limit(1);
+
+    if (existing.length > 0) {
+      return withCors(
+        NextResponse.json({
+          balance: existing[0].balanceAfter,
+          transactionId: existing[0].id,
+        }),
+      );
+    }
+  }
+
+  // Upsert wallet and grant credits atomically
+  const result = await db.execute<{
+    balance: number;
+    transaction_id: string;
+  }>(sql`
+    WITH upserted_wallet AS (
+      INSERT INTO credit_wallets (id, workspace_id, external_user_id, balance, total_granted, total_spent)
+      VALUES (gen_random_uuid()::text, ${workspace.id}, ${userId}, ${amount}, ${amount}, 0)
+      ON CONFLICT (workspace_id, external_user_id)
+      DO UPDATE SET
+        balance = credit_wallets.balance + ${amount},
+        total_granted = credit_wallets.total_granted + ${amount},
+        updated_at = now()
+      RETURNING id, balance
+    ),
+    ledger AS (
+      INSERT INTO credit_ledger_entries (id, wallet_id, workspace_id, type, amount, balance_before, balance_after, idempotency_key, metadata)
+      SELECT
+        gen_random_uuid()::text,
+        uw.id,
+        ${workspace.id},
+        'grant',
+        ${amount},
+        uw.balance - ${amount},
+        uw.balance,
+        ${idempotencyKey ?? null},
+        ${reason ? JSON.stringify({ reason }) : null}::jsonb
+      FROM upserted_wallet uw
+      RETURNING id, balance_after
+    )
+    SELECT l.balance_after as balance, l.id as transaction_id
+    FROM ledger l
+  `);
+
+  const row = result.rows[0];
+  if (!row) {
+    return withCors(
+      NextResponse.json({ error: "Failed to grant credits" }, { status: 500 }),
+    );
+  }
 
   return withCors(
-    NextResponse.json(
-      {
-        balance: amount,
-        transactionId: "stub",
-      },
-      { status: 200 },
-    ),
+    NextResponse.json({
+      balance: row.balance,
+      transactionId: row.transaction_id,
+    }),
   );
 }

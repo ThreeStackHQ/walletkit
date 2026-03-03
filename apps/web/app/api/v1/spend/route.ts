@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { and, eq, sql } from "drizzle-orm";
+import { getDb, creditWallets, creditLedgerEntries } from "@walletkit/db";
 import { rateLimit } from "@/lib/rate-limit";
 import { withCors, optionsResponse } from "@/lib/cors";
 import { resolveWorkspaceFromApiKey } from "@/lib/resolve-api-key";
+import { env } from "@/lib/env";
 
 const spendSchema = z.object({
   userId: z.string().min(1),
@@ -54,20 +57,89 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // TODO: deduct balance, write ledger entry — wallet must belong to workspace.id (IDOR guard)
-  const { userId, amount } = parsed.data;
-  void userId;
-  void amount;
-  void workspace;
+  const { userId, amount, idempotencyKey, metadata } = parsed.data;
+  const db = getDb(env.DATABASE_URL);
+
+  // Idempotency check: if this key was already used, return the previous result
+  if (idempotencyKey) {
+    const existing = await db
+      .select()
+      .from(creditLedgerEntries)
+      .where(
+        and(
+          eq(creditLedgerEntries.workspaceId, workspace.id),
+          eq(creditLedgerEntries.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .limit(1);
+
+    if (existing.length > 0) {
+      return withCors(
+        NextResponse.json({
+          allowed: true,
+          remaining: existing[0].balanceAfter,
+          transactionId: existing[0].id,
+        }),
+      );
+    }
+  }
+
+  // Atomic spend with FOR UPDATE row lock to prevent double-spend
+  const result = await db.execute<{
+    allowed: boolean;
+    remaining: number;
+    transaction_id: string | null;
+  }>(sql`
+    WITH wallet AS (
+      SELECT id, balance
+      FROM credit_wallets
+      WHERE workspace_id = ${workspace.id}
+        AND external_user_id = ${userId}
+      FOR UPDATE
+    ),
+    spend AS (
+      INSERT INTO credit_ledger_entries (id, wallet_id, workspace_id, type, amount, balance_before, balance_after, idempotency_key, metadata)
+      SELECT
+        gen_random_uuid()::text,
+        w.id,
+        ${workspace.id},
+        'spend',
+        ${amount},
+        w.balance,
+        w.balance - ${amount},
+        ${idempotencyKey ?? null},
+        ${metadata ? JSON.stringify(metadata) : null}::jsonb
+      FROM wallet w
+      WHERE w.balance >= ${amount}
+      RETURNING id, balance_after
+    ),
+    updated AS (
+      UPDATE credit_wallets
+      SET balance = balance - ${amount},
+          total_spent = total_spent + ${amount},
+          updated_at = now()
+      WHERE id = (SELECT id FROM wallet)
+        AND EXISTS (SELECT 1 FROM spend)
+      RETURNING balance
+    )
+    SELECT
+      CASE WHEN (SELECT count(*) FROM spend) > 0 THEN true ELSE false END as allowed,
+      COALESCE((SELECT balance FROM updated), (SELECT balance FROM wallet), 0) as remaining,
+      (SELECT id FROM spend) as transaction_id
+  `);
+
+  const row = result.rows[0];
+  if (!row) {
+    return withCors(
+      NextResponse.json({ allowed: false, remaining: 0, error: "Wallet not found" }),
+    );
+  }
 
   return withCors(
-    NextResponse.json(
-      {
-        allowed: true,
-        remaining: 0,
-        transactionId: "stub",
-      },
-      { status: 200 },
-    ),
+    NextResponse.json({
+      allowed: row.allowed,
+      remaining: row.remaining,
+      transactionId: row.transaction_id,
+    }),
   );
 }
